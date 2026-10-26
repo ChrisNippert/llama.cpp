@@ -159,6 +159,14 @@ int main(int argc, char ** argv) {
 
     const auto t_dec_start = ggml_time_us();
 
+
+    const char * env_k = getenv("TOP_K");
+    const int32_t top_k_accept = env_k ? atoi(env_k) : 1;
+
+
+    const char * env_p = getenv("P_RATIO");
+    const float p_ratio_accept = env_p ? atof(env_p) : 2.0f;
+
     while (true) {
         // generate or reuse draft tokens
         //
@@ -247,6 +255,7 @@ int main(int argc, char ** argv) {
         // save the size of the draft being verified
         const size_t n_draft = draft.size();
 
+
         // sample from the full target batch and return the accepted tokens based on the target sampler
         //
         // for each token to be accepted, the sampler would have to sample that same token
@@ -254,9 +263,9 @@ int main(int argc, char ** argv) {
         // available logits from the batch and sample the next token until we run out of logits or the sampler
         // disagrees with the draft
         //
-        auto ids = common_sampler_sample_and_accept_n(smpl.get(), ctx_tgt, draft);
-
-        //LOG_DBG("ids: %s\n", string_from(ctx_tgt, ids).c_str());
+        // auto ids = common_sampler_sample_and_accept_n(smpl.get(),s ctx_tgt, draft);
+        // auto ids = common_sampler_sample_and_accept_n_within_k(smpl.get(), ctx_tgt, draft,  top_k_accept);
+        auto ids = common_sampler_sample_and_accept_n_within_p(smpl.get(), ctx_tgt, draft,  p_ratio_accept);
 
         GGML_ASSERT(ids.size() > 0); // there will always be at least one accepted token
 

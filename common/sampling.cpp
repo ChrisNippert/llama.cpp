@@ -721,6 +721,152 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     return result;
 }
 
+// checks whether a given token `tok` is within the top `k` in the `logits`
+static bool token_in_top_k(const float * logits, int32_t n_vocab, llama_token tok, int32_t k){
+    GGML_ASSERT(k >= 1 && "K must be >= 1 for sampling with top K");
+    int32_t count = 0; // count greater than k
+    int32_t i = 0;
+    float tok_logit = logits[tok];
+    for (; i < n_vocab; i++) { // getting .size() of a pointer i think doesn't exist
+        if (logits[i] > tok_logit) {
+            count++;
+        }
+        if (count > k-1)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Check whether a grammar allows this next token
+static bool grammar_allows(struct common_sampler * gsmpl, llama_token tok) {
+    if (!grammar_should_apply(gsmpl)) {
+        return true;
+    }
+
+    // check if it the sampled token fits the grammar (grammar-based rejection sampling)
+    llama_token_data       single_token_data       = { tok, 1.0f, 0.0f };
+    llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
+
+    llama_sampler_apply(gsmpl->grmr, &single_token_data_array);
+
+    return single_token_data_array.data[0].logit != -INFINITY;
+}
+
+
+std::vector<llama_token> common_sampler_sample_and_accept_n_within_k(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, int32_t top_k_accept, bool grammar_first) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+
+    size_t i = 0;
+    for (; i < draft.size(); i++) {
+        // id is the guessed next token
+        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        const float * logits = llama_get_logits_ith(ctx, idxs[i]); // get real model's logits
+
+        const bool keep = draft[i] == id 
+        || (logits != nullptr 
+            && token_in_top_k(logits, n_vocab, draft[i], top_k_accept) 
+            && grammar_allows(gsmpl, draft[i]));
+        const llama_token token_emitted = keep ? draft[i] : id;
+
+
+        common_sampler_accept(gsmpl, token_emitted, true);
+        result.push_back(token_emitted); 
+
+        if (!keep || (llama_vocab_is_eog(vocab, token_emitted) && i + 1 < draft.size())) {
+            break;
+        }
+    }
+
+    if (i == draft.size()) {
+        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+
+        common_sampler_accept(gsmpl, id, true);
+
+        result.push_back(id);
+    }
+
+    return result;
+}
+
+// Returns true if the `tok` logit is within `ratio` of the target model.
+// say the max token the model made was 50% confident, the predicted token could be 40%.
+// that ratio would allow the proxy model to accept it when ratio is <= 0.8
+static bool token_within_ratio(const float * logits, int32_t n_vocab, llama_token tok, float ratio) {
+    float max = -INFINITY;
+    for (int32_t i = 0; i < n_vocab; i++) {
+        max = std::max(logits[i], max);
+    }
+    return expf(logits[tok] - max) >= ratio;
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n_within_p(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, float p_ratio_accept, bool grammar_first) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    
+    size_t i = 0;
+    for (; i < draft.size(); i++) {
+        // id is the guessed next token
+        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        const float * logits = llama_get_logits_ith(ctx, idxs[i]); // get real model's logits
+
+        const bool keep = draft[i] == id 
+        || (logits != nullptr 
+            && token_within_ratio(logits, n_vocab, draft[i], p_ratio_accept) 
+            && grammar_allows(gsmpl, draft[i]));
+        const llama_token token_emitted = keep ? draft[i] : id;
+
+
+        common_sampler_accept(gsmpl, token_emitted, true);
+        result.push_back(token_emitted); 
+
+        if (!keep || (llama_vocab_is_eog(vocab, token_emitted) && i + 1 < draft.size())) {
+            break;
+        }
+    }
+
+    if (i == draft.size()) {
+        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+
+        common_sampler_accept(gsmpl, id, true);
+
+        result.push_back(id);
+    }
+
+    return result;
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n_within_k(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, int32_t top_k_accept, bool grammar_first) {
+    std::vector<int> idxs(draft.size() + 1);
+    for (size_t i = 0; i < idxs.size(); ++i) {
+        idxs[i] = i;
+    }
+
+    return common_sampler_sample_and_accept_n_within_k(gsmpl, ctx, idxs, draft,  top_k_accept, grammar_first);
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n_within_p(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, float p_ratio_accept, bool grammar_first) {
+    std::vector<int> idxs(draft.size() + 1);
+    for (size_t i = 0; i < idxs.size(); ++i) {
+        idxs[i] = i;
+    }
+
+    return common_sampler_sample_and_accept_n_within_p(gsmpl, ctx, idxs, draft,  p_ratio_accept, grammar_first);
+}
+
+
 static float prob_of(const llama_token_data * data, size_t n, llama_token id) {
     for (size_t k = 0; k < n; ++k) {
         if (data[k].id == id) {
